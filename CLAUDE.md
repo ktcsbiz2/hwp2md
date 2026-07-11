@@ -7,16 +7,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make build          # Build binary to bin/hwp2md
 make test           # Run all tests with race detection and coverage
+make test-e2e       # Run E2E tests only (go test ./tests/... -run "E2E")
 make lint           # Run golangci-lint
 make fmt            # Format code
 make tidy           # Run go mod tidy
+make hooks          # Install git hooks (required for development)
 
 # Run a single test
 go test -v -run TestName ./internal/parser/hwpx/
 
-# E2E tests
-make test-e2e
+# Unit tests only
+go test -race ./internal/...
 ```
+
+### Git Hooks (installed via `make hooks`)
+
+- **pre-commit**: gofmt check → golangci-lint → unit tests (`./internal/...`). Blocks commit on failure.
+- **pre-push**: E2E tests. Blocks push on failure.
+- gofmt runs separately before golangci-lint so formatting is checked even when golangci-lint can't run.
+
+### CI (GitHub Actions)
+
+- **Test workflow** (push, PR): lint + unit tests + E2E tests
+- **Release workflow** (`v*` tags): goreleaser cross-platform binary build. A `release` skill in `.claude/skills/` automates versioning and release notes.
 
 ## Architecture
 
@@ -38,23 +51,26 @@ HWP/HWPX → Stage 1 (Parser) → IR → Stage 2 (LLM, optional) → Markdown
 
 ### Stage 2: LLM Providers (`internal/llm/`)
 - Common interface: `Provider` with `Format(ctx, doc, opts)` method
-- Providers: `anthropic/`, `openai/`, `gemini/`, `upstage/`, `ollama/`
-- Model name auto-detection: `claude-*` → Anthropic, `gpt-*` → OpenAI, etc.
+- Providers: `anthropic/`, `openai/`, `gemini/`, `upstage/`, `ollama/`; global registry in `registry.go`
+- Model name auto-detection (`detectProviderFromModel` in `internal/cli/convert.go`):
+  - empty → `anthropic` (default), `claude*` → anthropic, `gpt*`/`o1*`/`o3*` → openai, `gemini*` → gemini, `solar*` → upstage, anything else → ollama
+- `--base-url`/`HWP2MD_BASE_URL` enables private tenancy (Bedrock, Azure, local); gemini does not support custom base URLs
 
 ### Formatter (`internal/formatter/`)
 - **공문서 서식 변환** (`official.go`): 행정업무운영규정시행규칙 기준 항목 기호를 Markdown 헤딩/리스트로 치환
 - 7단계 계층: `1.`/`□` → `##`, `가.`/`○` → `-`, `1)` → `  -`, `가)` → `    -`, `(1)` → `      -`, `(가)` → `        -`, `①` → `          -`
+- 패턴 매칭 순서 중요: 괄호 포함 패턴(`(1)`, `(가)`)을 먼저 검사
 
 ### CLI (`internal/cli/`)
-- Entry point: `cmd/hwp2md/main.go`
-- Commands: `convert` (default), `extract`, `config`, `providers`
-- `convert.go`: Main conversion logic, parser selection, LLM formatting
+- Entry point: `cmd/hwp2md/main.go`, built on cobra
+- Commands: `convert` (default — a bare file argument runs convert), `extract`, `config`, `providers`, `version`
+- `convert.go`: Main conversion logic, parser selection, LLM formatting; flags include `--llm`, `--provider`, `--model`, `--base-url`, `--parser`, `--extract-images`
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `internal/cli/convert.go` | Main conversion pipeline, parser/LLM orchestration |
+| `internal/cli/convert.go` | Main conversion pipeline, parser/LLM orchestration, provider auto-detection |
 | `internal/formatter/official.go` | 공문서 항목 기호 감지 및 Markdown 치환 |
 | `internal/parser/hwpx/parser.go` | HWPX XML parsing, table/cell span handling |
 | `internal/parser/hwp5/parser.go` | HWP5 OLE2 parsing, main entry point |
@@ -63,6 +79,13 @@ HWP/HWPX → Stage 1 (Parser) → IR → Stage 2 (LLM, optional) → Markdown
 | `internal/ir/ir.go` | IR document structure definitions |
 | `internal/llm/provider.go` | LLM provider interface |
 | `internal/llm/prompt.go` | System prompts for LLM formatting |
+
+## Tests
+
+| Type | Path | Notes |
+|------|------|-------|
+| Unit tests | `internal/*/` | Per-package tests |
+| E2E/integration | `tests/` | CLI integration tests, LLM tests; sample documents in `testdata/` |
 
 ## Environment Variables
 
@@ -73,12 +96,15 @@ HWP/HWPX → Stage 1 (Parser) → IR → Stage 2 (LLM, optional) → Markdown
 | `HWP2MD_MODEL` | Model name (auto-detects provider) |
 | `HWP2MD_BASE_URL` | Private API endpoint (Bedrock, Azure, local) |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `UPSTAGE_API_KEY` | Provider API keys |
+| `OLLAMA_HOST` | Ollama server address (default: http://localhost:11434) |
 
 ## Conventions
 
-- Korean is the primary language for CLI messages, comments, and documentation
+- Korean is the primary language for CLI messages, comments, commit messages, and documentation
 - Cell merge handling: rowspan → `〃`, colspan → empty cell
 - Special whitespace elements (`<hp:fwSpace/>`, `<hp:hwSpace/>`) → regular space
+- Lint config in `.golangci.yml` (errcheck, gosimple, govet, ineffassign, staticcheck, unused, gofmt, goimports, misspell, revive — exported symbols need doc comments)
+- When fixing HWPX parsing issues or adding format handling, update `docs/hwpx-markdown-differences.md` (see the `update-hwpx-differences` skill)
 
 ## HWP5 Binary Format Notes
 
@@ -87,3 +113,4 @@ HWP/HWPX → Stage 1 (Parser) → IR → Stage 2 (LLM, optional) → Markdown
 - Text is UTF-16LE with inline control characters (Extended/Inline use +14 bytes)
 - Tables: CTRL_HEADER(" lbt") → TABLE → LIST_HEADER (per cell) → PARA_HEADER/PARA_TEXT
 - Compression: zlib or raw deflate (try zlib first, fallback to deflate)
+- Format references: `docs/hwp5-schema.md`, `docs/hwpx-schema.md`
